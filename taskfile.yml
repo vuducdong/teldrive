@@ -38,6 +38,11 @@ tasks:
     cmds:
       - go generate ./...
 
+  lint:
+    desc: Run linters
+    cmds:
+      - golangci-lint run
+
   server:
     desc: Build Server
     deps: [gen]
@@ -50,7 +55,6 @@ tasks:
         go build -trimpath -ldflags "-s -w
           -X '{{.MODULE_PATH}}/internal/version.Version={{.VERSION}}'
           -X '{{.MODULE_PATH}}/internal/version.CommitSHA={{.GIT_COMMIT}}'
-          -extldflags=-static
           " -o {{.BUILD_DIR}}/{{.APP_NAME}}{{.BINARY_EXTENSION}}
 
   run:

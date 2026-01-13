@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -67,8 +68,8 @@ func (m *MemoryCache) Get(key string, value any) error {
 }
 
 func (m *MemoryCache) Set(key string, value any, expiration time.Duration) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	key = m.prefix + key
 	data, err := msgpack.Marshal(value)
 	if err != nil {
@@ -78,8 +79,8 @@ func (m *MemoryCache) Set(key string, value any, expiration time.Duration) error
 }
 
 func (m *MemoryCache) Delete(keys ...string) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for _, key := range keys {
 		m.cache.Del([]byte(m.prefix + key))
 	}
@@ -113,8 +114,8 @@ func (r *RedisCache) Get(key string, value any) error {
 }
 
 func (r *RedisCache) Set(key string, value any, expiration time.Duration) error {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	key = r.prefix + key
 	data, err := msgpack.Marshal(value)
 	if err != nil {
@@ -124,8 +125,8 @@ func (r *RedisCache) Set(key string, value any, expiration time.Duration) error 
 }
 
 func (r *RedisCache) Delete(keys ...string) error {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for i := range keys {
 		keys[i] = r.prefix + keys[i]
 	}
@@ -141,7 +142,7 @@ func Fetch[T any](cache Cacher, key string, expiration time.Duration, fn func() 
 			if err != nil {
 				return zero, err
 			}
-			cache.Set(key, &value, expiration)
+			_ = cache.Set(key, &value, expiration)
 			return value, nil
 		}
 		return zero, err
@@ -192,6 +193,7 @@ func formatValue(v any) string {
 			v := formatValue(val.MapIndex(key).Interface())
 			parts = append(parts, fmt.Sprintf("%s=%s", k, v))
 		}
+		sort.Strings(parts)
 		return fmt.Sprintf("{%s}", strings.Join(parts, ","))
 	case reflect.Struct:
 		return fmt.Sprintf("%+v", v)

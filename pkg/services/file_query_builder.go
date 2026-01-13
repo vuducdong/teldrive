@@ -25,6 +25,8 @@ type fileResponse struct {
 	Total int
 }
 
+const folderCategory = "folder"
+
 var selectedFields = []string{"id", "name", "type", "mime_type", "category", "channel_id", "encrypted", "size", "parent_id", "updated_at"}
 
 func (afb *fileQueryBuilder) execute(filesQuery *api.FilesListParams, userId int64) (*api.FileList, error) {
@@ -33,7 +35,11 @@ func (afb *fileQueryBuilder) execute(filesQuery *api.FilesListParams, userId int
 	case api.FileQueryOperationList:
 		query = afb.applyListFilters(query, filesQuery, userId)
 	case api.FileQueryOperationFind:
-		query = afb.applyFindFilters(query, filesQuery, userId)
+		var err error
+		query, err = afb.applyFindFilters(query, filesQuery, userId)
+		if err != nil {
+			return nil, &apiError{err: err, code: 400}
+		}
 
 	}
 	query = afb.buildFileQuery(query, filesQuery, userId)
@@ -68,12 +74,16 @@ func (afb *fileQueryBuilder) applyListFilters(query *gorm.DB, filesQuery *api.Fi
 	return query
 }
 
-func (afb *fileQueryBuilder) applyFindFilters(query *gorm.DB, filesQuery *api.FilesListParams, userId int64) *gorm.DB {
+func (afb *fileQueryBuilder) applyFindFilters(query *gorm.DB, filesQuery *api.FilesListParams, userId int64) (*gorm.DB, error) {
+	var err error
 	if filesQuery.DeepSearch.Value && filesQuery.Query.Value != "" && filesQuery.Path.Value != "" {
 		query = query.Where("files.id in (select id  from subdirs)")
 	}
 	if filesQuery.UpdatedAt.Value != "" {
-		query, _ = afb.applyDateFilters(query, filesQuery.UpdatedAt.Value)
+		query, err = afb.applyDateFilters(query, filesQuery.UpdatedAt.Value)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if filesQuery.Query.Value != "" {
@@ -84,7 +94,7 @@ func (afb *fileQueryBuilder) applyFindFilters(query *gorm.DB, filesQuery *api.Fi
 
 	query = afb.applyFileSpecificFilters(query, filesQuery, userId)
 
-	return query
+	return query, nil
 }
 
 func (afb *fileQueryBuilder) applyFileSpecificFilters(query *gorm.DB, filesQuery *api.FilesListParams, userId int64) *gorm.DB {
@@ -167,7 +177,7 @@ func (afb *fileQueryBuilder) applyCategoryFilter(query *gorm.DB, categories []ap
 		return query
 	}
 	var filterQuery *gorm.DB
-	if categories[0] == "folder" {
+	if categories[0] == folderCategory {
 		filterQuery = afb.db.Where("type = ?", categories[0])
 	} else {
 		filterQuery = afb.db.Where("category = ?", categories[0])
@@ -175,7 +185,7 @@ func (afb *fileQueryBuilder) applyCategoryFilter(query *gorm.DB, categories []ap
 
 	if len(categories) > 1 {
 		for _, category := range categories[1:] {
-			if category == "folder" {
+			if category == folderCategory {
 				filterQuery = filterQuery.Or("type = ?", category)
 			} else {
 				filterQuery = filterQuery.Or("category = ?", category)
@@ -186,16 +196,43 @@ func (afb *fileQueryBuilder) applyCategoryFilter(query *gorm.DB, categories []ap
 }
 
 func (afb *fileQueryBuilder) buildFileQuery(query *gorm.DB, filesQuery *api.FilesListParams, userId int64) *gorm.DB {
-	orderField := utils.CamelToSnake(string(filesQuery.Sort.Value))
+	orderField := getValidSortField(filesQuery.Sort.Value)
+	orderDir := getValidOrderDirection(filesQuery.Order.Value)
 	op := getOrderOperation(filesQuery)
 
 	return afb.buildSubqueryCTE(query, filesQuery, userId).Clauses(exclause.NewWith("ranked_scores", afb.db.Model(&models.File{}).Select(orderField, "count(*) OVER () as total",
-		fmt.Sprintf("ROW_NUMBER() OVER (ORDER BY %s %s) AS rank", orderField, strings.ToUpper(string(filesQuery.Order.Value)))).
+		fmt.Sprintf("ROW_NUMBER() OVER (ORDER BY %s %s) AS rank", orderField, orderDir)).
 		Where(query))).Model(&models.File{}).
 		Select(selectedFields, "(select total from ranked_scores limit 1) as total").
 		Where(fmt.Sprintf("%s %s (SELECT %s FROM ranked_scores WHERE rank = ?)", orderField, op, orderField),
 			max((filesQuery.Page.Value-1)*filesQuery.Limit.Value, 1)).
 		Where(query).Order(getOrder(filesQuery)).Limit(filesQuery.Limit.Value)
+}
+
+func getValidSortField(sort api.FileQuerySort) string {
+	switch sort {
+	case api.FileQuerySortName:
+		return "name"
+	case api.FileQuerySortUpdatedAt:
+		return "updated_at"
+	case api.FileQuerySortSize:
+		return "size"
+	case api.FileQuerySortID:
+		return "id"
+	default:
+		return "updated_at"
+	}
+}
+
+func getValidOrderDirection(order api.FileQueryOrder) string {
+	switch order {
+	case api.FileQueryOrderAsc:
+		return "ASC"
+	case api.FileQueryOrderDesc:
+		return "DESC"
+	default:
+		return "DESC"
+	}
 }
 
 func (afb *fileQueryBuilder) buildSubqueryCTE(query *gorm.DB, filesQuery *api.FilesListParams, userId int64) *gorm.DB {
@@ -211,8 +248,9 @@ func (afb *fileQueryBuilder) buildSubqueryCTE(query *gorm.DB, filesQuery *api.Fi
 }
 
 func getOrder(filesQuery *api.FilesListParams) string {
-	orderField := utils.CamelToSnake(string(filesQuery.Sort.Value))
-	return fmt.Sprintf("%s %s", orderField, strings.ToUpper(string(filesQuery.Order.Value)))
+	orderField := getValidSortField(filesQuery.Sort.Value)
+	orderDir := getValidOrderDirection(filesQuery.Order.Value)
+	return fmt.Sprintf("%s %s", orderField, orderDir)
 }
 
 func getOrderOperation(filesQuery *api.FilesListParams) string {

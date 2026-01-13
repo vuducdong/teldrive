@@ -24,6 +24,7 @@ import (
 	"github.com/tgdrive/teldrive/internal/database"
 	"github.com/tgdrive/teldrive/internal/events"
 	"github.com/tgdrive/teldrive/internal/http_range"
+	"github.com/tgdrive/teldrive/internal/logging"
 	"github.com/tgdrive/teldrive/internal/md5"
 	"github.com/tgdrive/teldrive/internal/reader"
 	"github.com/tgdrive/teldrive/internal/tgc"
@@ -31,6 +32,7 @@ import (
 	"github.com/tgdrive/teldrive/pkg/mapper"
 	"github.com/tgdrive/teldrive/pkg/models"
 	"github.com/tgdrive/teldrive/pkg/types"
+	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -50,6 +52,9 @@ func (b *buffer) long() (int64, error) {
 	v, err := b.uint64()
 	if err != nil {
 		return 0, err
+	}
+	if v > 1<<63-1 {
+		return 0, errors.New("value overflows int64")
 	}
 	return int64(v), nil
 
@@ -134,7 +139,7 @@ func (a *apiService) FilesCopy(ctx context.Context, req *api.FileCopy, params ap
 
 	err = tgc.RunWithAuth(ctx, client, "", func(ctx context.Context) error {
 
-		ids := utils.Map(file.Parts, func(part api.Part) int { return part.ID })
+		ids := utils.Map(*file.Parts, func(part api.Part) int { return part.ID })
 		messages, err := tgc.GetMessages(ctx, client.API(), ids, *file.ChannelId)
 
 		if err != nil {
@@ -177,8 +182,8 @@ func (a *apiService) FilesCopy(ctx context.Context, req *api.FileCopy, params ap
 
 			}
 			p := api.Part{ID: msg.ID}
-			if file.Parts[i].Salt.Value != "" {
-				p.Salt = file.Parts[i].Salt
+			if (*file.Parts)[i].Salt.Value != "" {
+				p.Salt = (*file.Parts)[i].Salt
 			}
 			newIds = append(newIds, p)
 
@@ -190,7 +195,7 @@ func (a *apiService) FilesCopy(ctx context.Context, req *api.FileCopy, params ap
 		return nil, &apiError{err: err}
 	}
 
-	if len(newIds) != len(file.Parts) {
+	if len(newIds) != len(*file.Parts) {
 		return nil, &apiError{err: errors.New("failed to copy all file parts")}
 	}
 
@@ -213,18 +218,18 @@ func (a *apiService) FilesCopy(ctx context.Context, req *api.FileCopy, params ap
 	dbFile.Type = string(file.Type)
 	dbFile.MimeType = file.MimeType
 	if len(newIds) > 0 {
-		dbFile.Parts = datatypes.NewJSONSlice(newIds)
+		dbFile.Parts = utils.Ptr(datatypes.NewJSONSlice(newIds))
 	}
 	dbFile.UserId = userId
 	dbFile.Status = "active"
 	dbFile.ParentId = utils.Ptr(parentId)
 	dbFile.ChannelId = &channelId
 	dbFile.Encrypted = file.Encrypted
-	dbFile.Category = string(file.Category)
+	dbFile.Category = file.Category
 	if req.UpdatedAt.IsSet() && !req.UpdatedAt.Value.IsZero() {
-		dbFile.UpdatedAt = req.UpdatedAt.Value
+		dbFile.UpdatedAt = utils.Ptr(req.UpdatedAt.Value)
 	} else {
-		dbFile.UpdatedAt = time.Now().UTC()
+		dbFile.UpdatedAt = utils.Ptr(time.Now().UTC())
 	}
 
 	if err := a.db.Create(&dbFile).Error; err != nil {
@@ -274,10 +279,10 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 	}
 
 	switch fileIn.Type {
-	case "folder":
+	case api.FileTypeFolder:
 		fileDB.MimeType = "drive/folder"
 		fileDB.Parts = nil
-	case "file":
+	case api.FileTypeFile:
 		if fileIn.ChannelId.Value == 0 {
 			channelId, err = a.channelManager.CurrentChannel(userId)
 			if err != nil {
@@ -288,9 +293,9 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 		}
 		fileDB.ChannelId = &channelId
 		fileDB.MimeType = fileIn.MimeType.Value
-		fileDB.Category = string(category.GetCategory(fileIn.Name))
+		fileDB.Category = utils.Ptr(string(category.GetCategory(fileIn.Name)))
 		if len(fileIn.Parts) > 0 {
-			fileDB.Parts = datatypes.NewJSONSlice(mapParts(fileIn.Parts))
+			fileDB.Parts = utils.Ptr(datatypes.NewJSONSlice(mapParts(fileIn.Parts)))
 		}
 		fileDB.Size = utils.Ptr(fileIn.Size.Value)
 	}
@@ -300,9 +305,9 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 	fileDB.Status = "active"
 	fileDB.Encrypted = utils.Ptr(fileIn.Encrypted.Value)
 	if fileIn.UpdatedAt.IsSet() && !fileIn.UpdatedAt.Value.IsZero() {
-		fileDB.UpdatedAt = fileIn.UpdatedAt.Value
+		fileDB.UpdatedAt = utils.Ptr(fileIn.UpdatedAt.Value)
 	} else {
-		fileDB.UpdatedAt = time.Now().UTC()
+		fileDB.UpdatedAt = utils.Ptr(time.Now().UTC())
 	}
 
 	//For some reason, gorm conflict clauses are not working with partial index so using raw query
@@ -406,7 +411,7 @@ func (a *apiService) FilesDeleteShare(ctx context.Context, params api.FilesDelet
 		return &apiError{err: err}
 	}
 	if deletedShare.ID != "" {
-		a.cache.Delete(cache.Key("shared", deletedShare.ID))
+		_ = a.cache.Delete(cache.Key("shared", deletedShare.ID))
 	}
 
 	return nil
@@ -582,23 +587,23 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 		updateDb.Name = req.Name.Value
 	}
 	if len(req.Parts) > 0 {
-		updateDb.Parts = datatypes.NewJSONSlice(mapParts(req.Parts))
+		updateDb.Parts = utils.Ptr(datatypes.NewJSONSlice(mapParts(req.Parts)))
 	}
 	if req.Size.Value != 0 {
 		updateDb.Size = utils.Ptr(req.Size.Value)
 	}
 
-	updateDb.UpdatedAt = req.UpdatedAt.Value
+	updateDb.UpdatedAt = utils.Ptr(req.UpdatedAt.Value)
 
 	if req.UpdatedAt.Value.IsZero() {
-		updateDb.UpdatedAt = time.Now().UTC()
+		updateDb.UpdatedAt = utils.Ptr(time.Now().UTC())
 	}
 
 	if err := a.db.Model(&models.File{}).Where("id = ?", params.ID).Updates(updateDb).Error; err != nil {
 		return nil, &apiError{err: err}
 	}
 
-	a.cache.Delete(cache.Key("files", params.ID))
+	_ = a.cache.Delete(cache.Key("files", params.ID))
 
 	file := models.File{}
 	if err := a.db.Where("id = ?", params.ID).First(&file).Error; err != nil {
@@ -633,7 +638,7 @@ func (a *apiService) FilesUpdateParts(ctx context.Context, req *api.FilePartsUpd
 		updatePayload.ChannelId = &req.ChannelId.Value
 	}
 	if len(req.Parts) > 0 {
-		updatePayload.Parts = datatypes.NewJSONSlice(mapParts(req.Parts))
+		updatePayload.Parts = utils.Ptr(datatypes.NewJSONSlice(mapParts(req.Parts)))
 	}
 	if req.Name.Value != "" {
 		updatePayload.Name = req.Name.Value
@@ -642,7 +647,7 @@ func (a *apiService) FilesUpdateParts(ctx context.Context, req *api.FilePartsUpd
 		updatePayload.ParentId = utils.Ptr(req.ParentId.Value)
 	}
 
-	updatePayload.UpdatedAt = req.UpdatedAt
+	updatePayload.UpdatedAt = utils.Ptr(req.UpdatedAt)
 	updatePayload.Encrypted = utils.Ptr(req.Encrypted.Value)
 
 	err := a.db.Transaction(func(tx *gorm.DB) error {
@@ -666,23 +671,24 @@ func (a *apiService) FilesUpdateParts(ctx context.Context, req *api.FilePartsUpd
 	}
 
 	keys := []string{cache.Key("files", params.ID)}
-	if len(file.Parts) > 0 && file.ChannelId != nil {
-		ids := utils.Map(file.Parts, func(part api.Part) int { return part.ID })
+	if len(*file.Parts) > 0 && file.ChannelId != nil {
+		ids := utils.Map(*file.Parts, func(part api.Part) int { return part.ID })
 		client, _ := tgc.AuthClient(ctx, &a.cnf.TG, auth.GetJWTUser(ctx).TgSession, a.middlewares...)
-		tgc.DeleteMessages(ctx, client, *file.ChannelId, ids)
+		_ = tgc.DeleteMessages(ctx, client, *file.ChannelId, ids)
 		keys = append(keys, cache.Key("files", "messages", params.ID))
-		for _, part := range file.Parts {
+		for _, part := range *file.Parts {
 			keys = append(keys, cache.Key("files", "location", params.ID, part.ID))
 		}
 
 	}
-	a.cache.Delete(keys...)
+	_ = a.cache.Delete(keys...)
 
 	return nil
 }
 
 func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fileId string, userId int64) {
 	ctx := r.Context()
+	logger := logging.FromContext(ctx)
 	var (
 		session *models.Session
 		err     error
@@ -792,76 +798,82 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 
 	w.WriteHeader(status)
 
-	if r.Method == "HEAD" {
+	if r.Method == http.MethodHead {
 		return
 	}
 
 	tokens, err := e.api.channelManager.BotTokens(session.UserId)
 
 	if err != nil {
+		logger.Error("failed to get bots", zap.Error(err))
 		http.Error(w, "failed to get bots", http.StatusInternalServerError)
 		return
 	}
 
 	var (
-		lr           io.ReadCloser
-		client       *telegram.Client
-		multiThreads int
-		token        string
+		lr     io.ReadCloser
+		client *telegram.Client
+		token  string
 	)
 
-	multiThreads = e.api.cnf.TG.Stream.MultiThreads
-	middlewares := tgc.NewMiddleware(&e.api.cnf.TG, tgc.WithFloodWait(),
-		tgc.WithRecovery(ctx),
-		tgc.WithRetry(5),
-		tgc.WithRateLimit())
-	if e.api.cnf.TG.DisableStreamBots || len(tokens) == 0 {
+	middlewares := tgc.NewMiddleware(&e.api.cnf.TG, tgc.WithFloodWait(), tgc.WithRateLimit())
+	if len(tokens) == 0 {
 		client, err = tgc.AuthClient(ctx, &e.api.cnf.TG, session.Session, middlewares...)
 		if err != nil {
+			logger.Error("failed to create auth client", zap.Error(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		multiThreads = 0
 
 	} else {
 		e.api.worker.Set(tokens, session.UserId)
-
 		token, _ = e.api.worker.Next(session.UserId)
-
 		client, err = tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, middlewares...)
 		if err != nil {
+			logger.Error("failed to create bot client", zap.Error(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
-	if download {
-		multiThreads = 0
-	}
 
-	if r.Method != "HEAD" {
+	if r.Method != http.MethodHead {
 		handleStream := func() error {
 			parts, err := getParts(ctx, client, e.api.cache, file)
 			if err != nil {
+				logger.Error("failed to get file parts", zap.Error(err))
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return nil
 			}
-			lr, err = reader.NewLinearReader(ctx, client.API(), e.api.cache, file, parts, start, end, &e.api.cnf.TG, multiThreads)
+
+			lr, err = reader.NewReader(ctx,
+				client.API(),
+				e.api.cache,
+				file,
+				parts,
+				start,
+				end,
+				&e.api.cnf.TG,
+			)
+
 			if err != nil {
+				logger.Error("failed to create reader", zap.Error(err))
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return nil
 			}
 			if lr == nil {
+				logger.Error("reader is nil")
 				http.Error(w, "failed to initialise reader", http.StatusInternalServerError)
 				return nil
 			}
 
 			_, err = io.CopyN(w, lr, contentLength)
 			if err != nil {
-				lr.Close()
+				_ = lr.Close()
 			}
 			return nil
 		}
-		tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
+
+		_ = tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
 			return handleStream()
 		})
 

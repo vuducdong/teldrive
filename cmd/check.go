@@ -5,47 +5,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/fatih/color"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/telegram/query/messages"
 	"github.com/gotd/td/tg"
-	"github.com/jedib0t/go-pretty/v6/progress"
-	"github.com/jedib0t/go-pretty/v6/text"
-	"github.com/manifoldco/promptui"
+	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 	"github.com/tgdrive/teldrive/internal/api"
 	"github.com/tgdrive/teldrive/internal/config"
 	"github.com/tgdrive/teldrive/internal/crypt"
 	"github.com/tgdrive/teldrive/internal/database"
-	"github.com/tgdrive/teldrive/internal/logging"
 	"github.com/tgdrive/teldrive/internal/tgc"
 	"github.com/tgdrive/teldrive/internal/utils"
 	"github.com/tgdrive/teldrive/pkg/models"
+	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/term"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
-
-var termWidth = func() (width int, err error) {
-	width, _, err = term.GetSize(int(os.Stdout.Fd()))
-	if err == nil {
-		return width, nil
-	}
-
-	return 0, err
-}
 
 type file struct {
 	ID        string
 	Name      string
 	Size      int64
 	Encrypted bool
+	Status    string
 	Parts     datatypes.JSONSlice[api.Part]
 }
 
@@ -62,27 +51,47 @@ type channelExport struct {
 }
 
 type channelProcessor struct {
-	id             int64
-	files          []file
-	missingFiles   []file
-	orphanMessages []int
-	totalCount     int64
-	pw             progress.Writer
-	tracker        *progress.Tracker
-	channelExport  *channelExport
-	client         *telegram.Client
-	ctx            context.Context
-	db             *gorm.DB
-	userId         int64
-	clean          bool
+	id              int64
+	cmd             *cobra.Command
+	files           []file
+	missingFiles    []file
+	orphanMessages  []int
+	totalCount      int64
+	totalPartsDB    int
+	totalMessagesTG int
+	mp              *pterm.MultiPrinter
+	pb              *pterm.ProgressbarPrinter
+	channelExport   *channelExport
+	client          *telegram.Client
+	ctx             context.Context
+	db              *gorm.DB
+	userId          int64
+	dryRun          bool
+	cfg             *config.CheckCmdConfig
+	session         string
 }
 
 func NewCheckCmd() *cobra.Command {
-	var cfg config.ServerCmdConfig
+	var cfg config.CheckCmdConfig
 	loader := config.NewConfigLoader()
 	cmd := &cobra.Command{
 		Use:   "check",
-		Short: "Check and purge incomplete files",
+		Short: "Check and purge incomplete files in Telegram channels",
+		Long: `Check the integrity of files stored in Telegram channels by comparing database records
+with actual Telegram messages. Identifies and removes missing file parts and orphan messages.
+
+Examples:
+  # Preview issues without making changes (dry-run)
+  teldrive check --user alice --dry-run
+
+  # Check, clean and export missing files to a custom file
+  teldrive check --export-file missing_files.json
+
+  # Clean missing and pending files along with incompleted uploads
+  teldrive check --clean-pending --clean-uploads
+
+  # Concurrent processing
+  teldrive check --concurrent 8`,
 		Run: func(cmd *cobra.Command, args []string) {
 			runCheckCmd(cmd, &cfg)
 		},
@@ -96,15 +105,11 @@ func NewCheckCmd() *cobra.Command {
 			return nil
 		},
 	}
-	loader.RegisterPlags(cmd.Flags(), "", cfg, true)
-	cmd.Flags().Bool("export", true, "Export incomplete files to json file")
-	cmd.Flags().Bool("clean", false, "Clean missing and orphan file parts")
-	cmd.Flags().String("user", "", "Telegram User Name")
-	cmd.Flags().Int("concurrent", 4, "Number of concurrent channel processing")
+	loader.RegisterFlags(cmd.Flags(), reflect.TypeFor[config.CheckCmdConfig]())
 	return cmd
 }
 
-func checkRequiredCheckFlags(cfg *config.ServerCmdConfig) error {
+func checkRequiredCheckFlags(cfg *config.CheckCmdConfig) error {
 	var missingFields []string
 	if cfg.DB.DataSource == "" {
 		missingFields = append(missingFields, "db-data-source")
@@ -125,49 +130,62 @@ func selectUser(user string, users []models.User) (*models.User, error) {
 		}
 		return &res[0], nil
 	}
-	templates := &promptui.SelectTemplates{
-		Label:    "{{ . }}",
-		Active:   "{{ .UserName | cyan }}",
-		Inactive: "{{ .UserName | white }}",
-		Selected: "{{ .UserName | red | cyan }}",
+
+	var options []string
+	for _, u := range users {
+		options = append(options, u.UserName)
 	}
 
-	prompt := promptui.Select{
-		Label:     "Select User",
-		Items:     users,
-		Templates: templates,
-		Size:      50,
-	}
-
-	index, _, err := prompt.Run()
+	selected, err := pterm.DefaultInteractiveSelect.
+		WithDefaultText("Select User").
+		WithOptions(options).
+		Show()
 	if err != nil {
 		return nil, err
 	}
-	return &users[index], nil
+
+	for i := range users {
+		if users[i].UserName == selected {
+			return &users[i], nil
+		}
+	}
+	return nil, fmt.Errorf("user not found")
 }
 
 func (cp *channelProcessor) updateStatus(status string, value int64) {
-	cp.tracker.SetValue(value)
-	cp.tracker.UpdateMessage(fmt.Sprintf("Channel %d: %s", cp.id, status))
+	if cp.pb != nil {
+		current := cp.pb.Current
+		if int(value) > current {
+			cp.pb.Add(int(value) - current)
+		}
+		cp.pb.UpdateTitle(fmt.Sprintf("Channel %d: %s", cp.id, status))
+	}
 }
 
 func (cp *channelProcessor) process() error {
+	cleanPending := cp.cfg.CleanPending
+	cleanUploads := cp.cfg.CleanUploads
+
+	if cleanUploads && !cp.dryRun {
+		cp.updateStatus("Deleting incomplete uploads from DB", 0)
+		if err := cp.db.Where("user_id = ?", cp.userId).
+			Where("channel_id = ?", cp.id).
+			Delete(&models.Upload{}).Error; err != nil {
+			return fmt.Errorf("failed to delete uploads: %w", err)
+		}
+	}
+
 	cp.updateStatus("Loading files", 0)
 	files, err := cp.loadFiles()
 	if err != nil {
-		return fmt.Errorf("failed to load files: %w", err)
+		return fmt.Errorf("failed to load files for channel %d: %w", cp.id, err)
 	}
 	cp.files = files
-
-	if len(cp.files) == 0 {
-		cp.updateStatus("No files found", 100)
-		return nil
-	}
 
 	cp.updateStatus("Loading messages from Telegram", 0)
 	msgs, total, err := cp.loadChannelMessages()
 	if err != nil {
-		return fmt.Errorf("failed to load messages: %w", err)
+		return fmt.Errorf("failed to load messages for channel %d: %w", cp.id, err)
 	}
 
 	if total == 0 && len(msgs) == 0 {
@@ -175,21 +193,23 @@ func (cp *channelProcessor) process() error {
 		return nil
 	}
 	if len(msgs) < total {
-		return fmt.Errorf("found %d messages out of %d", len(msgs), total)
+		return fmt.Errorf("channel %d: found %d messages out of %d", cp.id, len(msgs), total)
 	}
 
 	cp.updateStatus("Processing messages and parts", 0)
-	uploadPartIds := []int{}
-	if err := cp.db.Model(&models.Upload{}).
-		Where("user_id = ?", cp.userId).
-		Where("channel_id = ?", cp.id).
-		Pluck("part_id", &uploadPartIds).Error; err != nil {
-		return err
-	}
 
 	uploadPartMap := make(map[int]bool)
-	for _, partID := range uploadPartIds {
-		uploadPartMap[partID] = true
+	if !cp.dryRun && !cleanUploads {
+		uploadPartIds := []int{}
+		if err := cp.db.Model(&models.Upload{}).
+			Where("user_id = ?", cp.userId).
+			Where("channel_id = ?", cp.id).
+			Pluck("part_id", &uploadPartIds).Error; err != nil {
+			return fmt.Errorf("failed to query uploads for channel %d: %w", cp.id, err)
+		}
+		for _, id := range uploadPartIds {
+			uploadPartMap[id] = true
+		}
 	}
 
 	msgMap := make(map[int]int64)
@@ -233,15 +253,31 @@ func (cp *channelProcessor) process() error {
 		}
 	}
 
-	if len(allPartIDs) == 0 {
+	if len(allPartIDs) == 0 && len(cp.files) > 0 {
 		cp.updateStatus("No parts found", 100)
-		return nil
 	}
 
 	for msgID := range msgMap {
+		if msgID == 1 {
+			cp.totalMessagesTG--
+			continue
+		}
 		_, ok := allPartIDs[msgID]
 		if !ok {
 			cp.orphanMessages = append(cp.orphanMessages, msgID)
+		}
+	}
+	cp.totalPartsDB += len(allPartIDs)
+
+	cp.totalMessagesTG += len(msgMap)
+
+	if cleanPending && !cp.dryRun {
+		cp.updateStatus("Deleting pending files from DB", 0)
+		if err := cp.db.Where("user_id = ?", cp.userId).
+			Where("channel_id = ?", cp.id).
+			Where("status = ?", "pending_deletion").
+			Delete(&models.File{}).Error; err != nil {
+			return fmt.Errorf("failed to delete pending files: %w", err)
 		}
 	}
 
@@ -260,22 +296,30 @@ func (cp *channelProcessor) process() error {
 			})
 		}
 
-		if cp.clean {
+		if !cp.dryRun {
 			cp.updateStatus("Cleaning files", 0)
 			err = cp.db.Exec("call teldrive.delete_files_bulk($1 , $2)",
 				utils.Map(cp.missingFiles, func(f file) string { return f.ID }), cp.userId).Error
+			if err != nil {
+				return fmt.Errorf("failed to clean files for channel %d: %w", cp.id, err)
+			}
+		}
+
+	}
+
+	if len(cp.orphanMessages) > 0 {
+		if !cp.dryRun {
+			cp.updateStatus("Cleaning orphan messages", 0)
+			err = cp.initClient()
+			if err != nil {
+				return err
+			}
+			err = tgc.DeleteMessages(cp.ctx, cp.client, cp.id, cp.orphanMessages)
 			if err != nil {
 				return err
 			}
 		}
 	}
-
-	if cp.clean && len(cp.orphanMessages) > 0 {
-		cp.updateStatus("Cleaning orphan messages", 0)
-		tgc.DeleteMessages(cp.ctx, cp.client, cp.id, cp.orphanMessages)
-	}
-
-	cp.updateStatus("Complete", 100)
 	return nil
 }
 
@@ -285,11 +329,20 @@ func (cp *channelProcessor) loadFiles() ([]file, error) {
 	var totalFiles int64
 	var lastID string
 
-	if err := cp.db.Model(&models.File{}).
+	cleanPending := cp.cfg.CleanPending
+
+	db := cp.db.Model(&models.File{}).
 		Where("user_id = ?", cp.userId).
 		Where("channel_id = ?", cp.id).
-		Where("type = ?", "file").
-		Count(&totalFiles).Error; err != nil {
+		Where("type = ?", "file")
+
+	if cleanPending && cp.dryRun {
+		db = db.Where("status IN ?", []string{"active", "pending_deletion"})
+	} else {
+		db = db.Where("status = ?", "active")
+	}
+
+	if err := db.Count(&totalFiles).Error; err != nil {
 		return nil, err
 	}
 
@@ -306,6 +359,12 @@ func (cp *channelProcessor) loadFiles() ([]file, error) {
 			Where("type = ?", "file").
 			Order("id").
 			Limit(batchSize)
+
+		if cleanPending && cp.dryRun {
+			query = query.Where("status IN ?", []string{"active", "pending_deletion"})
+		} else {
+			query = query.Where("status = ?", "active")
+		}
 
 		if lastID != "" {
 			query = query.Where("id > ?", lastID)
@@ -334,8 +393,21 @@ func (cp *channelProcessor) loadFiles() ([]file, error) {
 	return files, nil
 }
 
-func (cp *channelProcessor) loadChannelMessages() (msgs []messages.Elem, total int, err error) {
+func (cp *channelProcessor) initClient() error {
+	middlewares := tgc.NewMiddleware(&cp.cfg.TG, tgc.WithFloodWait(), tgc.WithRateLimit())
+	client, err := tgc.AuthClient(cp.ctx, &cp.cfg.TG, cp.session, middlewares...)
+	if err != nil {
+		return fmt.Errorf("failed to create client %w", err)
+	}
+	cp.client = client
+	return nil
+}
 
+func (cp *channelProcessor) loadChannelMessages() (msgs []messages.Elem, total int, err error) {
+	err = cp.initClient()
+	if err != nil {
+		return nil, 0, err
+	}
 	err = tgc.RunWithAuth(cp.ctx, cp.client, "", func(ctx context.Context) error {
 		var channel *tg.InputChannel
 		channel, err = tgc.GetChannelById(ctx, cp.client.API(), cp.id)
@@ -351,7 +423,7 @@ func (cp *channelProcessor) loadChannelMessages() (msgs []messages.Elem, total i
 		msgiter := messages.NewIterator(q, 100)
 		total, err = msgiter.Total(ctx)
 		if err != nil {
-			return fmt.Errorf("failed to get total messages: %w", err)
+			return err
 		}
 
 		processed := 0
@@ -367,32 +439,31 @@ func (cp *channelProcessor) loadChannelMessages() (msgs []messages.Elem, total i
 		}
 		return nil
 	})
-	return
+	return msgs, total, err
 }
 
-func runCheckCmd(cmd *cobra.Command, cfg *config.ServerCmdConfig) {
+func runCheckCmd(cmd *cobra.Command, cfg *config.CheckCmdConfig) {
 
 	ctx := cmd.Context()
 
-	lg := logging.DefaultLogger().Sugar()
-
-	defer logging.DefaultLogger().Sync()
-
 	cfg.DB.LogLevel = "fatal"
-	db, err := database.NewDatabase(ctx, &cfg.DB, lg)
+	db, err := database.NewDatabase(ctx, &cfg.DB, zap.NewNop())
 	if err != nil {
-		lg.Fatalw("failed to create database", "err", err)
+		pterm.Error.Println("failed to connect to database", err)
+		os.Exit(1)
 	}
 
 	users := []models.User{}
 	if err := db.Model(&models.User{}).Find(&users).Error; err != nil {
-		lg.Fatalw("failed to get users", "err", err)
+		pterm.Error.Println("failed to retrieve users from database", err)
+		os.Exit(1)
 	}
 
-	userName, _ := cmd.Flags().GetString("user")
+	userName := cfg.User
 	user, err := selectUser(userName, users)
 	if err != nil {
-		lg.Fatalw("failed to select user", "err", err)
+		pterm.Error.Println("failed to select user", err)
+		os.Exit(1)
 	}
 
 	session := models.Session{}
@@ -400,116 +471,132 @@ func runCheckCmd(cmd *cobra.Command, cfg *config.ServerCmdConfig) {
 		Where("user_id = ?", user.UserId).
 		Order("created_at desc").
 		First(&session).Error; err != nil {
-		lg.Fatalw("failed to get session", "err", err)
+		pterm.Error.Println("failed to get user session - ensure user has logged in", err)
+		os.Exit(1)
 	}
 
 	channelIds := []int64{}
 	if err := db.Model(&models.Channel{}).
 		Where("user_id = ?", user.UserId).
 		Pluck("channel_id", &channelIds).Error; err != nil {
-		lg.Fatalw("failed to get channels", "err", err)
+		pterm.Error.Println("failed to get user channels", err)
+		os.Exit(1)
 	}
 
 	if len(channelIds) == 0 {
-		lg.Fatalw("no channels found")
+		pterm.Error.Println("no channels found for user - ensure channels are configured")
+		os.Exit(1)
 	}
 
-	middlewares := tgc.NewMiddleware(&cfg.TG, tgc.WithFloodWait(), tgc.WithRateLimit())
-	export, _ := cmd.Flags().GetBool("export")
-	clean, _ := cmd.Flags().GetBool("clean")
-	concurrent, _ := cmd.Flags().GetInt("concurrent")
+	exportFile := cfg.ExportFile
+	dryRun := cfg.DryRun
+	concurrent := cfg.Concurrent
 
-	pw := progress.NewWriter()
-	pw.SetAutoStop(false)
-	width := 75
-	if size, err := termWidth(); err == nil {
-		width = int((float32(3) / float32(4)) * float32(size))
+	if dryRun {
+		pterm.Info.Println("running in dry-run mode - no changes will be made")
 	}
-	pw.SetTrackerLength(width / 5)
-	pw.SetMessageLength(width * 3 / 5)
-	pw.SetStyle(progress.StyleDefault)
-	pw.SetTrackerPosition(progress.PositionRight)
-	pw.SetUpdateFrequency(time.Millisecond * 100)
-	pw.Style().Colors = progress.StyleColorsExample
-	pw.Style().Colors.Message = text.Colors{text.FgBlue}
-	pw.Style().Options.PercentFormat = "%4.1f%%"
-	pw.Style().Visibility.Value = false
-	pw.Style().Options.TimeInProgressPrecision = time.Millisecond
-	pw.Style().Options.ErrorString = color.RedString("failed!")
-	pw.Style().Options.DoneString = color.GreenString("done!")
+
+	multi := pterm.DefaultMultiPrinter
+	_, _ = multi.Start()
 
 	var channelExports []channelExport
 	var mutex sync.Mutex
+	var totalFiles, totalMissing, totalOrphans, totalCleanedFiles, totalCleanedOrphans int
+	var totalPartsDB, totalMessagesTG int
 
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.SetLimit(concurrent)
 
-	go pw.Render()
-
 	for _, id := range channelIds {
 
 		g.Go(func() error {
 
-			client, err := tgc.AuthClient(ctx, &cfg.TG, session.Session, middlewares...)
-			if err != nil {
-				lg.Errorw("failed to create client", "err", err, "channel", id)
-				return fmt.Errorf("failed to create client for channel %d: %w", id, err)
-			}
-
-			tracker := &progress.Tracker{
-				Message: fmt.Sprintf("Channel %d: Initializing", id),
-				Total:   100,
-				Units:   progress.UnitsDefault,
-			}
-			pw.AppendTracker(tracker)
+			pb, _ := pterm.DefaultProgressbar.
+				WithTotal(100).
+				WithWriter(multi.NewWriter()).
+				WithTitle(fmt.Sprintf("Channel %d: Initializing", id)).
+				Start()
 
 			processor := &channelProcessor{
 				id:         id,
-				client:     client,
+				cmd:        cmd,
 				ctx:        ctx,
+				cfg:        cfg,
+				session:    session.Session,
 				db:         db,
 				userId:     user.UserId,
-				clean:      clean,
-				pw:         pw,
-				tracker:    tracker,
+				dryRun:     dryRun,
+				mp:         &multi,
+				pb:         pb,
 				totalCount: 100,
 			}
 
 			if err := processor.process(); err != nil {
-				tracker.MarkAsErrored()
 				return err
 			}
 
+			mutex.Lock()
 			if processor.channelExport != nil {
-				mutex.Lock()
 				channelExports = append(channelExports, *processor.channelExport)
-				mutex.Unlock()
 			}
+			totalMissing += len(processor.missingFiles)
+			totalOrphans += len(processor.orphanMessages)
+			totalFiles += len(processor.files)
+			totalPartsDB += processor.totalPartsDB
+			totalMessagesTG += processor.totalMessagesTG
+			if !dryRun {
+				totalCleanedFiles += len(processor.missingFiles)
+				totalCleanedOrphans += len(processor.orphanMessages)
+			}
+			mutex.Unlock()
 
 			return nil
 		})
 	}
 
 	if err := g.Wait(); err != nil {
-		lg.Fatal(fmt.Errorf("one or more channels failed to process"))
+		pterm.Error.Println("one or more channels failed to process - check logs for details", err)
+		os.Exit(1)
 	}
 
-	pw.Stop()
+	_, _ = multi.Stop()
 
-	if export && len(channelExports) > 0 {
+	if !dryRun && len(channelExports) > 0 {
 		jsonData, err := json.MarshalIndent(channelExports, "", "    ")
 		if err != nil {
-			lg.Errorw("failed to marshal JSON", "err", err)
+			pterm.Error.Println("failed to generate JSON export", err)
 			return
 		}
 
-		err = os.WriteFile("results.json", jsonData, 0644)
+		err = os.WriteFile(exportFile, jsonData, 0644)
 		if err != nil {
-			lg.Errorw("failed to write JSON file", "err", err)
+			pterm.Error.Println("failed to write export file", err)
 			return
 		}
 
-		lg.Infof("Exported data to results.json")
+		pterm.Info.Println("exported incomplete files", pterm.Sprint(map[string]any{"file": exportFile, "count": totalMissing}))
 	}
+
+	pterm.DefaultHeader.WithFullWidth().Println("Check Summary")
+
+	data := [][]string{
+		{"Metric", "Value"},
+		{"Channels Processed", fmt.Sprint(len(channelIds))},
+		{"Total Files Checked", fmt.Sprint(totalFiles)},
+		{"Total Parts (DB)", fmt.Sprint(totalPartsDB)},
+		{"Total Messages (TG)", fmt.Sprint(totalMessagesTG)},
+		{"Missing Files", fmt.Sprint(totalMissing)},
+		{"Orphan Messages", fmt.Sprint(totalOrphans)},
+	}
+
+	if dryRun {
+		data = append(data, []string{"Would Clean Files", fmt.Sprint(totalMissing)})
+		data = append(data, []string{"Would Clean Orphans", fmt.Sprint(totalOrphans)})
+	} else {
+		data = append(data, []string{"Cleaned Files", fmt.Sprint(totalCleanedFiles)})
+		data = append(data, []string{"Cleaned Orphans", fmt.Sprint(totalCleanedOrphans)})
+	}
+
+	_ = pterm.DefaultTable.WithHasHeader().WithBoxed().WithData(data).Render()
 }
