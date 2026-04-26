@@ -2,6 +2,7 @@ package reader
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 
@@ -9,7 +10,6 @@ import (
 	"github.com/tgdrive/teldrive/internal/cache"
 	"github.com/tgdrive/teldrive/internal/config"
 	"github.com/tgdrive/teldrive/internal/crypt"
-	"github.com/tgdrive/teldrive/pkg/models"
 	"github.com/tgdrive/teldrive/pkg/types"
 )
 
@@ -20,7 +20,7 @@ type Range struct {
 
 type Reader struct {
 	ctx         context.Context
-	file        *models.File
+	file        *FileRef
 	parts       []types.Part
 	ranges      []Range
 	pos         int
@@ -33,6 +33,12 @@ type Reader struct {
 	closeOnce   sync.Once
 	closeErr    error
 	botID       string
+}
+
+type FileRef struct {
+	ID        string
+	ChannelID int64
+	Encrypted bool
 }
 
 func calculatePartByteRanges(start, end, partSize int64) []Range {
@@ -55,7 +61,7 @@ func calculatePartByteRanges(start, end, partSize int64) []Range {
 func NewReader(ctx context.Context,
 	client *tg.Client,
 	cache cache.Cacher,
-	file *models.File,
+	file *FileRef,
 	parts []types.Part,
 	start,
 	end int64,
@@ -64,7 +70,7 @@ func NewReader(ctx context.Context,
 ) (io.ReadCloser, error) {
 
 	size := parts[0].Size
-	if *file.Encrypted {
+	if file.Encrypted {
 		size = parts[0].DecryptedSize
 	}
 	r := &Reader{
@@ -132,11 +138,25 @@ func (r *Reader) moveToNextPart() error {
 }
 
 func (r *Reader) getPartReader() (io.ReadCloser, error) {
+	if r.pos < 0 || r.pos >= len(r.ranges) {
+		return nil, fmt.Errorf("reader position %d out of range [0, %d)", r.pos, len(r.ranges))
+	}
 	currentRange := r.ranges[r.pos]
+	// r.ranges is built from user-visible byte offsets and r.parts is
+	// populated from the file row in storage. The two can drift (for
+	// example when a file's parts list changes between request and
+	// response), and a stale currentRange.PartNo then indexes past the
+	// end of r.parts and panics the whole stream goroutine with an
+	// index-out-of-range mid-download (#553). Surface a normal error
+	// instead so the HTTP handler returns 500 rather than killing the
+	// server.
+	if currentRange.PartNo < 0 || currentRange.PartNo >= int64(len(r.parts)) {
+		return nil, fmt.Errorf("part number %d out of range for file with %d parts", currentRange.PartNo, len(r.parts))
+	}
 	partId := r.parts[currentRange.PartNo].ID
 
 	chunkSrc := &chunkSource{
-		channelId:   *r.file.ChannelId,
+		channelId:   r.file.ChannelID,
 		partId:      partId,
 		client:      r.client,
 		concurrency: r.concurrency,
@@ -151,7 +171,7 @@ func (r *Reader) getPartReader() (io.ReadCloser, error) {
 
 	reader, err = newTGMultiReader(r.ctx, currentRange.Start, currentRange.End, r.config, chunkSrc)
 
-	if *r.file.Encrypted {
+	if r.file.Encrypted {
 		salt := r.parts[r.ranges[r.pos].PartNo].Salt
 		cipher, _ := crypt.NewCipher(r.config.Uploads.EncryptionKey, salt)
 		reader, err = cipher.DecryptDataSeek(r.ctx,
